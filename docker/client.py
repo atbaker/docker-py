@@ -403,10 +403,13 @@ class Client(requests.Session):
         json_ = res.json()
         s_port = str(private_port)
         f_port = None
-        if s_port in json_['NetworkSettings']['PortMapping']['Udp']:
-            f_port = json_['NetworkSettings']['PortMapping']['Udp'][s_port]
-        elif s_port in json_['NetworkSettings']['PortMapping']['Tcp']:
-            f_port = json_['NetworkSettings']['PortMapping']['Tcp'][s_port]
+        # print json_
+        # if s_port in json_['NetworkSettings']['PortMapping']['Udp']:
+        #     f_port = json_['NetworkSettings']['PortMapping']['Udp'][s_port]
+        # elif s_port in json_['NetworkSettings']['PortMapping']['Tcp']:
+        #     f_port = json_['NetworkSettings']['PortMapping']['Tcp'][s_port]
+        if s_port in json_['NetworkSettings']['Ports'].keys():
+            f_port = json_['NetworkSettings']['Ports'][s_port]
 
         return f_port
 
