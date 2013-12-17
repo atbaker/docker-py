@@ -36,7 +36,7 @@ def expand_registry_url(hostname):
         if '/' not in hostname[9:]:
             hostname = hostname + '/v1/'
         return hostname
-    if utils.ping('https://' + hostname + '_ping'):
+    if utils.ping('https://' + hostname + '/v1/_ping'):
         return 'https://' + hostname + '/v1/'
     return 'http://' + hostname + '/v1/'
 
@@ -89,11 +89,11 @@ def decode_auth(auth):
         auth = auth.encode('ascii')
     s = base64.b64decode(auth)
     login, pwd = s.split(b':')
-    return login, pwd
+    return login.decode('ascii'), pwd.decode('ascii')
 
 
 def encode_header(auth):
-    auth_json = json.dumps(auth)
+    auth_json = json.dumps(auth).encode('ascii')
     return base64.b64encode(auth_json)
 
 

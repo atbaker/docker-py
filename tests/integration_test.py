@@ -12,9 +12,11 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import time
 import base64
 import io
 import os
+import signal
 import tempfile
 import unittest
 
@@ -30,7 +32,7 @@ class BaseTestCase(unittest.TestCase):
     tmp_containers = []
 
     def setUp(self):
-        self.client = docker.Client(version="1.6")
+        self.client = docker.Client()
         self.client.pull('busybox')
         self.tmp_imgs = []
         self.tmp_containers = []
@@ -73,9 +75,9 @@ class TestSearch(BaseTestCase):
     def runTest(self):
         res = self.client.search('busybox')
         self.assertTrue(len(res) >= 1)
-        base_img = [x for x in res if x['Name'] == 'busybox']
+        base_img = [x for x in res if x['name'] == 'busybox']
         self.assertEqual(len(base_img), 1)
-        self.assertIn('Description', base_img[0])
+        self.assertIn('description', base_img[0])
 
 ###################
 ## LISTING TESTS ##
@@ -160,14 +162,6 @@ class TestCreateContainerWithBinds(BaseTestCase):
         self.assertIn(filename, logs)
 
 
-class TestCreateContainerPrivileged(BaseTestCase):
-    def runTest(self):
-        res = self.client.create_container('busybox', 'true', privileged=True)
-        inspect = self.client.inspect_container(res['Id'])
-        self.assertIn('Config', inspect)
-        self.assertEqual(inspect['Config']['Privileged'], True)
-
-
 class TestCreateContainerWithName(BaseTestCase):
     def runTest(self):
         res = self.client.create_container('busybox', 'true', name='foobar')
@@ -212,6 +206,28 @@ class TestStartContainerWithDictInsteadOfId(BaseTestCase):
         if not inspect['State']['Running']:
             self.assertIn('ExitCode', inspect['State'])
             self.assertEqual(inspect['State']['ExitCode'], 0)
+
+
+class TestStartContainerPrivileged(BaseTestCase):
+    def runTest(self):
+        res = self.client.create_container('busybox', 'true')
+        self.assertIn('Id', res)
+        self.tmp_containers.append(res['Id'])
+        self.client.start(res['Id'], privileged=True)
+        inspect = self.client.inspect_container(res['Id'])
+        self.assertIn('Config', inspect)
+        self.assertIn('ID', inspect)
+        self.assertTrue(inspect['ID'].startswith(res['Id']))
+        self.assertIn('Image', inspect)
+        self.assertIn('State', inspect)
+        self.assertIn('Running', inspect['State'])
+        if not inspect['State']['Running']:
+            self.assertIn('ExitCode', inspect['State'])
+            self.assertEqual(inspect['State']['ExitCode'], 0)
+        # Since Nov 2013, the Privileged flag is no longer part of the
+        # container's config exposed via the API (safety concerns?).
+        #
+        # self.assertEqual(inspect['Config']['Privileged'], True)
 
 
 class TestWait(BaseTestCase):
@@ -369,6 +385,24 @@ class TestKillWithDictInsteadOfId(BaseTestCase):
         self.assertEqual(state['Running'], False)
 
 
+class TestKillWithSignal(BaseTestCase):
+    def runTest(self):
+        container = self.client.create_container('busybox', ['sleep', '60'])
+        id = container['Id']
+        self.client.start(id)
+        self.tmp_containers.append(id)
+        self.client.kill(id, signal=signal.SIGTERM)
+        exitcode = self.client.wait(id)
+        self.assertNotEqual(exitcode, 0)
+        container_info = self.client.inspect_container(id)
+        self.assertIn('State', container_info)
+        state = container_info['State']
+        self.assertIn('ExitCode', state)
+        self.assertNotEqual(state['ExitCode'], 0)
+        self.assertIn('Running', state)
+        self.assertEqual(state['Running'], False, state)
+
+
 class TestRestart(BaseTestCase):
     def runTest(self):
         container = self.client.create_container('busybox', ['sleep', '9999'])
@@ -435,6 +469,94 @@ class TestRemoveContainerWithDictInsteadOfId(BaseTestCase):
         res = [x for x in containers if 'Id' in x and x['Id'].startswith(id)]
         self.assertEqual(len(res), 0)
 
+
+class TestStartContainerWithLinks(BaseTestCase):
+    def runTest(self):
+        res0 = self.client.create_container(
+            'busybox', 'cat',
+            detach=True, stdin_open=True,
+            environment={'FOO': '1'})
+
+        container1_id = res0['Id']
+        self.tmp_containers.append(container1_id)
+
+        self.client.start(container1_id)
+
+        res1 = self.client.create_container(
+            'busybox', 'cat',
+            detach=True, stdin_open=True,
+            environment={'FOO': '1'})
+
+        container2_id = res1['Id']
+        self.tmp_containers.append(container2_id)
+
+        self.client.start(container2_id)
+
+        # we don't want the first /
+        link_path1 = self.client.inspect_container(container1_id)['Name'][1:]
+        link_alias1 = 'mylink1'
+        link_env_prefix1 = link_alias1.upper()
+
+        link_path2 = self.client.inspect_container(container2_id)['Name'][1:]
+        link_alias2 = 'mylink2'
+        link_env_prefix2 = link_alias2.upper()
+
+        res2 = self.client.create_container('busybox', 'env')
+        container3_id = res2['Id']
+        self.tmp_containers.append(container3_id)
+        self.client.start(
+            container3_id,
+            links={link_path1: link_alias1, link_path2: link_alias2}
+        )
+        self.assertEqual(self.client.wait(container3_id), 0)
+
+        logs = self.client.logs(container3_id)
+        self.assertIn('{0}_NAME='.format(link_env_prefix1), logs)
+        self.assertIn('{0}_ENV_FOO=1'.format(link_env_prefix1), logs)
+        self.assertIn('{0}_NAME='.format(link_env_prefix2), logs)
+        self.assertIn('{0}_ENV_FOO=1'.format(link_env_prefix2), logs)
+
+#################
+## LINKS TESTS ##
+#################
+
+
+class TestRemoveLink(BaseTestCase):
+    def runTest(self):
+        # Create containers
+        container1 = self.client.create_container(
+            'busybox', 'cat', detach=True, stdin_open=True)
+        container1_id = container1['Id']
+        self.tmp_containers.append(container1_id)
+        self.client.start(container1_id)
+
+        # Create Link
+        # we don't want the first /
+        link_path = self.client.inspect_container(container1_id)['Name'][1:]
+        link_alias = 'mylink'
+
+        container2 = self.client.create_container('busybox', 'cat')
+        container2_id = container2['Id']
+        self.tmp_containers.append(container2_id)
+        self.client.start(container2_id, links={link_path: link_alias})
+
+        # Remove link
+        linked_name = self.client.inspect_container(container2_id)['Name'][1:]
+        link_name = '%s/%s' % (linked_name, link_alias)
+        self.client.remove_container(link_name, link=True)
+
+        # Link is gone
+        containers = self.client.containers(all=True)
+        retrieved = [x for x in containers if link_name in x['Names']]
+        self.assertEqual(len(retrieved), 0)
+
+        # Containers are still there
+        retrieved = [
+            x for x in containers if x['Id'].startswith(container1_id)
+            or x['Id'].startswith(container2_id)
+        ]
+        self.assertEqual(len(retrieved), 2)
+
 ##################
 ## IMAGES TESTS ##
 ##################
@@ -451,6 +573,28 @@ class TestPull(BaseTestCase):
         self.assertIn('Images', info)
         img_count = info['Images']
         res = self.client.pull('joffrey/test001')
+        self.assertEqual(type(res), six.text_type)
+        self.assertEqual(img_count + 2, self.client.info()['Images'])
+        img_info = self.client.inspect_image('joffrey/test001')
+        self.assertIn('id', img_info)
+        self.tmp_imgs.append('joffrey/test001')
+        self.tmp_imgs.append('376968a23351')
+
+
+class TestPullStream(BaseTestCase):
+    def runTest(self):
+        try:
+            self.client.remove_image('joffrey/test001')
+            self.client.remove_image('376968a23351')
+        except docker.APIError:
+            pass
+        info = self.client.info()
+        self.assertIn('Images', info)
+        img_count = info['Images']
+        stream = self.client.pull('joffrey/test001', stream=True)
+        res = u''
+        for chunk in stream:
+            res += chunk
         self.assertEqual(type(res), six.text_type)
         self.assertEqual(img_count + 2, self.client.info()['Images'])
         img_info = self.client.inspect_image('joffrey/test001')
@@ -529,6 +673,23 @@ class TestBuild(BaseTestCase):
         self.tmp_imgs.append(img)
 
 
+class TestBuildStream(BaseTestCase):
+    def runTest(self):
+        script = io.BytesIO('\n'.join([
+            'FROM busybox',
+            'MAINTAINER docker-py',
+            'RUN mkdir -p /tmp/test',
+            'EXPOSE 8080',
+            'ADD https://dl.dropboxusercontent.com/u/20637798/silence.tar.gz'
+            ' /tmp/silence.tar.gz'
+        ]).encode('ascii'))
+        stream = self.client.build(fileobj=script, stream=True)
+        logs = ''
+        for chunk in stream:
+            logs += chunk
+        self.assertNotEqual(logs, '')
+
+
 class TestBuildFromStringIO(BaseTestCase):
     def runTest(self):
         if six.PY3:
@@ -601,6 +762,26 @@ class TestLoadConfig(BaseTestCase):
         self.assertEqual(cfg['Password'], b'izayoi')
         self.assertEqual(cfg['Email'], 'sakuya@scarlet.net')
         self.assertEqual(cfg.get('Auth'), None)
+
+
+class TestConnectionTimeout(unittest.TestCase):
+    def setUp(self):
+        self.timeout = 0.5
+        self.client = docker.client.Client(base_url='http://192.168.10.2:4243',
+                                           timeout=self.timeout)
+
+    def runTest(self):
+        start = time.time()
+        res = None
+        # This call isn't supposed to complete, and it should fail fast.
+        try:
+            res = self.client.inspect_container('id')
+        except:
+            pass
+        end = time.time()
+        self.assertTrue(res is None)
+        self.assertTrue(end - start < 2 * self.timeout)
+
 
 if __name__ == '__main__':
     unittest.main()
